@@ -54,7 +54,7 @@ local BackoffFactor  = 1.45
 local SpeedupFactor  = 0.88
 local SpeedupAfter   = 4
 local PanicMB        = 250
-local StartDelay     = 0.10
+local StartDelay     = 0.8
 local BuildYieldEvery = 100000
 local CapOutgoing    = false
 -- ══════════════════════════════
